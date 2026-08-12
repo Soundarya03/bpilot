@@ -1,0 +1,43 @@
+name: bpilot
+base: core24
+version: 0.1.0
+summary: Intelligent backport helper for git repositories
+description: |
+  bpilot automates the mechanical parts of backporting changes between git
+  branches (fetch, branch, cherry-pick) and provides an LLM-assisted layer
+  for conflict resolution and semantic gap analysis. The LLM is a pure
+  text-in/text-out function; only the git-ops layer ever mutates the repo.
+
+  Configure via `snap set bpilot openrouter-api-key=...` or the
+  OPENROUTER_API_KEY environment variable.
+
+grade: devel
+confinement: classic
+
+apps:
+  bpilot:
+    command: bin/bpilot
+
+parts:
+  bpilot:
+    plugin: poetry
+    source: .
+    build-packages:
+      # The poetry plugin runs `python3 -m venv`, which needs ensurepip
+      # from python3-venv. On core24 (Python 3.12) this coexists with
+      # python3-pip cleanly — unlike core26's python3.14-venv, which
+      # Breaks: python3-pip and gets silently dropped by apt.
+      - python3.12
+      - python3.12-venv
+    stage-packages:
+      # Python runtime is split across three packages on Ubuntu:
+      # - python3.12-minimal: the /usr/bin/python3.12 binary
+      # - libpython3.12-minimal: core stdlib (encodings, os, io, etc.)
+      # - libpython3.12-stdlib: extended stdlib (ssl, json, etc.)
+      # snapcraft doesn't reliably pull transitive deps of stage-packages,
+      # so we list all three explicitly.
+      - python3.12-minimal
+      - libpython3.12-minimal
+      - libpython3.12-stdlib
+      # Bundle git so the snap is self-contained under classic confinement.
+      - git
