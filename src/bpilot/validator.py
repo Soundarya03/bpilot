@@ -1,31 +1,67 @@
 """Static validator — deterministic checks after cherry-pick and conflict
 resolution.
 
-No LLM inference happens here. The validator has two entry points:
+No LLM inference happens here. The validator has three entry points:
 
 - `validate_file()`: per-file checks (conflict markers, syntax, placeholders).
   Used by the resolver during conflict resolution, with errors fed back to
   the LLM for retries.
 
 - `validate_changes()`: post-cherry-pick validation pass that runs on ALL
-  changed files (even clean picks), plus repo-wide checks:
-  1. Per-file checks on every changed file.
-  2. Dependency lock regeneration if pyproject.toml etc. were modified.
-  3. Linting and formatting (ruff, etc.) if configured in SKILL.md or
-     detected from the project's tooling.
+  changed files (even clean picks): per-file checks plus dependency lock
+  regeneration. No shell-command checks (those live in `run_verification_checks`).
 
-Per BACKPORT_HELPER_PLAN.md §6, the validator runs always — clean cherry-
-picks AND after conflict resolution.
+- `run_verification_checks()`: runs the project's format, lint, and
+  unit-test commands sourced from the SKILL.md "Verification Checks"
+  section (falling back to "Test Commands", then to auto-detected
+  defaults). Used by the verification fixer's LLM repair loop.
+
+Per BACKPORT_HELPER_PLAN.md §6 + §6b, the validator runs always — clean
+cherry-picks AND after conflict resolution. The verification check
+commands (form / lint / unit tests) are run separately so the fixer can
+retry them in a bounded loop (max 5 iterations) with LLM-assisted repair.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bpilot.skill_loader import SkillFile
+from bpilot.skill_loader import SkillSet
+
+# Snap-injected environment variables that must be stripped before spawning
+# host project tools (verification checks, lock regeneration). The classic-
+# confined snap bundles its own python3.12 + libraries; leaving these in the
+# environment makes host binaries load the snap's libraries and break in
+# opaque ways. Stripped only when running under snap (SNAP env var present);
+# outside the snap a developer's exported PYTHONPATH/VIRTUAL_ENV is legitimate
+# and must not be touched.
+_SNAP_ENV_VARS = ("LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
+
+
+def build_tool_env() -> dict[str, str] | None:
+    """Environment for spawned project tools (verification checks, lock regen).
+
+    Returns None (inherit unchanged) when not running under snap. When running
+    as a snap (SNAP env var present), returns a copy of ``os.environ`` with
+    snap-injected variables removed, so host binaries never load the snap's
+    bundled libraries.
+
+    Inline ``VAR=value`` prefixes in a skill command (e.g.
+    ``PYTHONPATH=src:lib poetry run pytest``) set that variable via the shell
+    for that command only, so scrubbing the parent's snap-injected value does
+    not interfere.
+    """
+    if "SNAP" not in os.environ:
+        return None
+    env = dict(os.environ)
+    for var in _SNAP_ENV_VARS:
+        env.pop(var, None)
+    return env
+
 
 # Files with these extensions get language-aware syntax checks.
 _PY_EXTENSIONS = {".py"}
@@ -65,7 +101,6 @@ class RepoValidationResult:
     ok: bool = True
     file_results: list[ValidationResult] = field(default_factory=list)
     lock_regen: list[str] = field(default_factory=list)  # commands run
-    lint_results: list[str] = field(default_factory=list)  # output lines
     errors: list[str] = field(default_factory=list)
 
     def add_error(self, msg: str) -> None:
@@ -75,6 +110,48 @@ class RepoValidationResult:
     @property
     def failed_files(self) -> list[str]:
         return [r.path for r in self.file_results if not r.ok]
+
+
+@dataclass
+class CommandResult:
+    """Outcome of running a single static-check command."""
+
+    command: str
+    ok: bool
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 0
+
+    @property
+    def output(self) -> str:
+        """Combined stdout + stderr, stripped."""
+        return (self.stdout + "\n" + self.stderr).strip()
+
+
+@dataclass
+class VerificationResult:
+    """Outcome of running all verification check commands once."""
+
+    ok: bool = True
+    commands: list[CommandResult] = field(default_factory=list)
+
+    @property
+    def failures(self) -> list[CommandResult]:
+        return [c for c in self.commands if not c.ok]
+
+    @property
+    def failure_summary(self) -> str:
+        """Human-readable summary of failing commands + their output."""
+        if self.ok:
+            return ""
+        lines: list[str] = []
+        for f in self.failures:
+            lines.append(f"$ {f.command} (exit {f.returncode})")
+            out = f.output
+            if out:
+                lines.append(out)
+            lines.append("")
+        return "\n".join(lines).strip()
 
 
 def validate_file(path: str, *, cwd: Path) -> ValidationResult:
@@ -123,21 +200,27 @@ def validate_changes(
     *,
     changed_files: list[str],
     cwd: Path,
-    skill: SkillFile | None = None,
+    skill_set: SkillSet | None = None,
 ) -> RepoValidationResult:
-    """Post-cherry-pick validation pass. Runs on ALL changed files.
+    """Post-cherry-pick per-file validation pass. Runs on ALL changed files.
 
     This is the main entry point for the CLI after all cherry-picks
-    complete (even clean ones). It:
+    complete (even clean ones). It runs:
 
-    1. Runs per-file checks (conflict markers, syntax, placeholders) on
-       every changed file.
+    1. Per-file checks (conflict markers, syntax, placeholders) on every
+       changed file.
     2. Regenerates dependency lock files if pyproject.toml etc. were
        modified.
-    3. Runs linters and formatters if available.
+
+    It does NOT run the project's format/lint/unit-test commands — those
+    live in `run_verification_checks()`, which the verification fixer
+    invokes in its LLM repair loop.
 
     Failures are collected but don't abort the backport — they're
     surfaced in the report for the user to address.
+
+    `skill_set` is accepted for API symmetry with `run_verification_checks`
+    but is not currently used by the per-file pass.
     """
     result = RepoValidationResult()
 
@@ -148,21 +231,74 @@ def validate_changes(
             for err in fr.errors:
                 result.add_error(f"{fr.path}: {err}")
 
-    # 2. Dependency lock regeneration.
-    if any(f in _DEPENDENCY_FILES or f.endswith(".lock") for f in changed_files):
-        _regen_locks(cwd, result)
-
-    # 3. Lint and format.
-    _run_linters(cwd, result, skill)
+    # 2. Dependency lock regeneration. Compare basenames so monorepo
+    # layouts (e.g. `machines/pyproject.toml`) also trigger regen.
+    if any(Path(f).name in _DEPENDENCY_FILES or f.endswith(".lock") for f in changed_files):
+        _regen_locks(cwd, result, changed_files)
 
     return result
 
 
-def _regen_locks(cwd: Path, result: RepoValidationResult) -> None:
+def run_verification_checks(
+    *,
+    cwd: Path,
+    skill_set: SkillSet | None = None,
+) -> VerificationResult:
+    """Run the project's format, lint, and unit-test commands once.
+
+    Commands are sourced from (in priority order):
+      1. The `verification-checks` skill's "Verification Checks" section
+         (falling back to "Test Commands").
+      2. Auto-detected defaults for Python projects (ruff check + format).
+
+    Each command runs via the shell (subprocess) and its stdout/stderr +
+    exit code are captured. Returns a VerificationResult aggregating all
+    commands. Used by the verification fixer's bounded LLM repair loop.
+    """
+    commands: list[str] = []
+    if skill_set is not None:
+        verification_skill = skill_set.get("verification-checks")
+        if verification_skill is not None:
+            commands.extend(verification_skill.verification_checks)
+
+    # Auto-detect ruff if no skill commands.
+    if not commands and (cwd / "pyproject.toml").is_file() and _has_command("ruff"):
+        commands.extend(["ruff check src/ tests/", "ruff format --check src/ tests/"])
+
+    result = VerificationResult()
+    for cmd_str in commands:
+        print(f"  running: {cmd_str} ...")
+        proc = subprocess.run(
+            cmd_str,
+            cwd=cwd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_tool_env(),
+        )
+        cr = CommandResult(
+            command=cmd_str,
+            ok=proc.returncode == 0,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            returncode=proc.returncode,
+        )
+        result.commands.append(cr)
+        if not cr.ok:
+            result.ok = False
+    return result
+
+
+def _regen_locks(cwd: Path, result: RepoValidationResult, changed_files: list[str]) -> None:
     """Regenerate dependency lock files if the project uses a known tool.
 
-    Detects the tool from files present in the repo:
-    - poetry.lock -> `poetry lock --no-update`
+    Detects the tool from lock files present in the repo and runs the
+    regeneration command in each directory that holds one — the repo root
+    plus every directory containing a changed dependency/lock file, so
+    monorepo layouts (e.g. `machines/poetry.lock`) are covered:
+    - poetry.lock -> `poetry lock` (Poetry 2.x locks without updating by
+      default; the old `--no-update` flag no longer exists)
     - uv.lock -> `uv lock`
     - package-lock.json -> `npm install --package-lock-only`
     - Cargo.lock -> `cargo generate-lockfile`
@@ -170,59 +306,43 @@ def _regen_locks(cwd: Path, result: RepoValidationResult) -> None:
 
     Failures are non-fatal (collected as warnings).
     """
-    lock_commands: list[tuple[str, list[str]]] = []
+    candidates: list[Path] = [cwd]
+    for f in changed_files:
+        parent = (cwd / f).parent
+        if parent != cwd and parent.is_dir() and parent not in candidates:
+            candidates.append(parent)
 
-    if (cwd / "poetry.lock").is_file() and _has_command("poetry"):
-        lock_commands.append(("poetry", ["poetry", "lock", "--no-update"]))
-    elif (cwd / "uv.lock").is_file() and _has_command("uv"):
-        lock_commands.append(("uv", ["uv", "lock"]))
-    elif (cwd / "package-lock.json").is_file() and _has_command("npm"):
-        lock_commands.append(("npm", ["npm", "install", "--package-lock-only"]))
-    elif (cwd / "Cargo.lock").is_file() and _has_command("cargo"):
-        lock_commands.append(("cargo", ["cargo", "generate-lockfile"]))
-    elif (cwd / "go.sum").is_file() and _has_command("go"):
-        lock_commands.append(("go", ["go", "mod", "tidy"]))
+    for d in candidates:
+        lock_commands: list[tuple[str, list[str]]] = []
 
-    for name, cmd in lock_commands:
-        print(f"  regenerating lock file via {name} ...")
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
-        cmd_str = " ".join(cmd)
-        result.lock_regen.append(cmd_str)
-        if proc.returncode != 0:
-            result.add_error(f"lock regeneration failed ({cmd_str}): {proc.stderr.strip()}")
+        if (d / "poetry.lock").is_file() and _has_command("poetry"):
+            lock_commands.append(("poetry", ["poetry", "lock"]))
+        elif (d / "uv.lock").is_file() and _has_command("uv"):
+            lock_commands.append(("uv", ["uv", "lock"]))
+        elif (d / "package-lock.json").is_file() and _has_command("npm"):
+            lock_commands.append(("npm", ["npm", "install", "--package-lock-only"]))
+        elif (d / "Cargo.lock").is_file() and _has_command("cargo"):
+            lock_commands.append(("cargo", ["cargo", "generate-lockfile"]))
+        elif (d / "go.sum").is_file() and _has_command("go"):
+            lock_commands.append(("go", ["go", "mod", "tidy"]))
 
-
-def _run_linters(cwd: Path, result: RepoValidationResult, skill: SkillFile | None) -> None:
-    """Run linters and formatters available in the project.
-
-    Priority:
-    1. Commands from SKILL.md "Test Commands" section (if present).
-    2. Auto-detected tools (ruff for Python projects).
-
-    Only format checks run here (not unit tests). Failures are non-fatal.
-    """
-    commands: list[str] = []
-
-    if skill and skill.test_commands:
-        commands.extend(skill.test_commands)
-
-    # Auto-detect ruff if no skill commands.
-    if not commands and (cwd / "pyproject.toml").is_file() and _has_command("ruff"):
-        commands.extend(["ruff check src/ tests/", "ruff format --check src/ tests/"])
-
-    for cmd_str in commands:
-        print(f"  running: {cmd_str} ...")
-        cmd = cmd_str.split()
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
-        if proc.returncode != 0:
-            # Capture the first few lines of output for the report.
-            output = (proc.stdout + proc.stderr).strip()
-            lines = output.splitlines()[:10]
-            for line in lines:
-                result.lint_results.append(f"[{cmd_str}] {line}")
-            result.add_error(f"check failed: {cmd_str}")
-        else:
-            result.lint_results.append(f"[{cmd_str}] passed")
+        for name, cmd in lock_commands:
+            rel = "." if d == cwd else str(d.relative_to(cwd))
+            print(f"  regenerating lock file via {name} ({rel}) ...")
+            proc = subprocess.run(
+                cmd,
+                cwd=d,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=build_tool_env(),
+            )
+            cmd_str = " ".join(cmd)
+            result.lock_regen.append(cmd_str if d == cwd else f"{cmd_str} (in {rel})")
+            if proc.returncode != 0:
+                result.add_error(
+                    f"lock regeneration failed ({cmd_str} in {rel}): {proc.stderr.strip()}"
+                )
 
 
 def _has_command(cmd: str) -> bool:

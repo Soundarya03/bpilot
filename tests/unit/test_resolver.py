@@ -17,12 +17,13 @@ from bpilot.resolver import (
     MAX_RETRIES,
     _build_prompt,
     _build_skill_context,
+    _diff_additions,
     _extract_content,
     resolve_conflicts,
 )
-from bpilot.skill_loader import load_skill
+from bpilot.skill_loader import SkillFile, SkillSet, load_skill_set
 
-FIXTURE = Path(__file__).parent.parent / "fixtures" / "sample_skill.md"
+FIXTURES = Path(__file__).parent.parent / "fixtures" / "skills"
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -83,7 +84,7 @@ def test_resolve_conflicts_success(conflict_repo: Path):
         target_branch="target",
         commit_message="main edit",
         llm=llm,
-        skill=None,
+        skill_set=None,
         cwd=conflict_repo,
     )
     assert result.all_resolved is True
@@ -112,7 +113,7 @@ def test_resolve_conflicts_retries_on_failure(conflict_repo: Path):
         target_branch="target",
         commit_message="main edit",
         llm=llm,
-        skill=None,
+        skill_set=None,
         cwd=conflict_repo,
     )
     assert result.all_resolved is True
@@ -120,6 +121,104 @@ def test_resolve_conflicts_retries_on_failure(conflict_repo: Path):
     assert len(result.attempts) == 1
     assert result.attempts[0].succeeded is True
     assert result.attempts[0].attempt == 2
+
+
+def test_resolve_conflicts_skips_files_via_skill_patterns(conflict_repo: Path):
+    """Files matching the skill's Skip Files take the TARGET branch's version.
+
+    Regression test for the ours/theirs semantics of a cherry-pick: during
+    `git cherry-pick`, `--ours` is the branch being picked onto (the target)
+    and `--theirs` is the incoming commit — so skipping must use `--ours`
+    to retain the target's version (e.g. of a lock file). The LLM must not
+    be consulted for skipped files.
+    """
+    llm = _make_llm("value = 'llm-should-not-be-called'\n")
+    skill = SkillFile(
+        name="conflict-resolution",
+        description="x",
+        path=conflict_repo / "SKILL.md",
+        sections={"Skip Files": "- shared.py\n- *.lock"},
+    )
+    skill_set = SkillSet(skills_dir=conflict_repo, skills={"conflict-resolution": skill})
+    result = resolve_conflicts(
+        commit="abc123",
+        conflicted_files=["shared.py"],
+        target_branch="target",
+        commit_message="main edit",
+        llm=llm,
+        skill_set=skill_set,
+        cwd=conflict_repo,
+    )
+    assert result.all_resolved is True
+    assert result.attempts[0].attempt == 0  # skipped, no LLM attempt
+    llm.query_llm.assert_not_called()
+    # Target branch's version retained, not the cherry-picked commit's.
+    assert (conflict_repo / "shared.py").read_text() == "value = 'target'\n"
+
+
+def test_resolve_conflicts_retry_when_incoming_addition_is_dropped(conflict_repo: Path):
+    """The dropped-additions guard feeds back missing incoming lines.
+
+    The fixture's cherry-pick conflicts on shared.py ('target' vs
+    'main'); the incoming `main` commit adds `value = 'main'`. A
+    resolution that keeps only the target line drops the incoming
+    change — the guard must catch it and force a corrective retry.
+    """
+    llm = MagicMock()
+    dropping = MagicMock()
+    dropping.text = "value = 'target'\n"
+    merged = MagicMock()
+    merged.text = "value = 'main'\n"
+    llm.query_llm.side_effect = [dropping, merged]
+    result = resolve_conflicts(
+        commit="main",  # real ref so get_commit_diff works
+        conflicted_files=["shared.py"],
+        target_branch="target",
+        commit_message="main edit",
+        llm=llm,
+        skill_set=None,
+        cwd=conflict_repo,
+    )
+    assert result.all_resolved is True
+    assert result.attempts[0].attempt == 2
+    assert (conflict_repo / "shared.py").read_text() == "value = 'main'\n"
+
+
+def test_resolve_conflicts_accepts_repeated_intentional_drop(conflict_repo: Path, capsys):
+    """An omission the LLM repeats after feedback is accepted, with a note.
+
+    Bounds the guard's feedback loop to one cycle: if the LLM returns the
+    same omission a second time, it's treated as a deliberate choice and
+    the resolution is accepted (the loop must terminate).
+    """
+    llm = _make_llm("value = 'target'\n")  # always drops 'main'
+    result = resolve_conflicts(
+        commit="main",
+        conflicted_files=["shared.py"],
+        target_branch="target",
+        commit_message="main edit",
+        llm=llm,
+        skill_set=None,
+        cwd=conflict_repo,
+    )
+    assert result.all_resolved is True
+    assert llm.query_llm.call_count == 2  # attempt + one feedback cycle
+    err = capsys.readouterr().err
+    assert "omits incoming lines" in err
+
+
+def test_diff_additions_extracts_added_lines():
+    """The guard's addition extractor splits +lines, ignoring +++/metadata."""
+    diff = (
+        "--- a/f\n"
+        "+++ b/f\n"
+        "@@ -1,3 +1,4 @@\n"
+        " kept\n"
+        "-old = 'x'\n"
+        "+new = 'y'\n"
+        '+mysql-connector-python = "~9.1.0"\n'
+    )
+    assert _diff_additions(diff) == ["new = 'y'", 'mysql-connector-python = "~9.1.0"']
 
 
 def test_resolve_conflicts_fails_after_max_retries(conflict_repo: Path):
@@ -131,7 +230,7 @@ def test_resolve_conflicts_fails_after_max_retries(conflict_repo: Path):
         target_branch="target",
         commit_message="main edit",
         llm=llm,
-        skill=None,
+        skill_set=None,
         cwd=conflict_repo,
     )
     assert result.all_resolved is False
@@ -153,7 +252,7 @@ def test_resolve_conflicts_syntax_error_retries(conflict_repo: Path):
         target_branch="target",
         commit_message="main edit",
         llm=llm,
-        skill=None,
+        skill_set=None,
         cwd=conflict_repo,
     )
     assert result.all_resolved is True
@@ -169,7 +268,7 @@ def test_resolve_conflicts_strips_markdown_fences(conflict_repo: Path):
         target_branch="target",
         commit_message="main edit",
         llm=llm,
-        skill=None,
+        skill_set=None,
         cwd=conflict_repo,
     )
     assert result.all_resolved is True
@@ -193,6 +292,23 @@ def test_build_prompt_includes_file_and_target():
     assert "<<<<< content" in prompt
     assert "original" in prompt
     assert "COMPLETE resolved file content" in prompt
+
+
+def test_build_prompt_includes_incoming_diff():
+    """The prompt carries the incoming commit's per-file diff when available."""
+    prompt = _build_prompt(
+        file_path="src/app.py",
+        conflict_content="content",
+        target_content="original",
+        target_branch="target",
+        commit_message="msg",
+        incoming_diff="+jubilant = '^1.8'\n",
+        skill_context="",
+        previous_error="",
+        attempt=1,
+    )
+    assert "incoming commit's change" in prompt
+    assert "+jubilant = '^1.8'" in prompt
 
 
 def test_build_prompt_includes_previous_error():
@@ -226,15 +342,18 @@ def test_build_prompt_includes_skill_context():
     assert "8.4 has shortcut" in prompt
 
 
-def test_build_skill_context_with_skill():
-    skill = load_skill(FIXTURE)
-    assert skill is not None
-    context = _build_skill_context(skill)
-    assert "Branch Conventions" in context
-    assert "Known Divergences" in context
+def test_build_skill_context_with_skill_set():
+    skill_set = load_skill_set(FIXTURES)
+    assert skill_set is not None
+    context = _build_skill_context(skill_set)
+    # conflict-resolution skill body (Skip Files) is included.
+    assert "poetry.lock" in context
+    # general-context is auto-appended.
+    assert "## general-context" in context
+    assert "is_data_dir_initialised" in context
 
 
-def test_build_skill_context_without_skill():
+def test_build_skill_context_without_skill_set():
     assert _build_skill_context(None) == ""
 
 

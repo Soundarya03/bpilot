@@ -57,8 +57,28 @@ class GapFinding:
 
 
 @dataclass
+class PotentialGap:
+    """A checklist item the LLM could not resolve — surfaced to the user.
+
+    Recorded when the analyzer hits `APPLIES: uncertain` or exhausts its
+    exploration budget without a verdict. No commit, no fix attempt.
+    """
+
+    checklist_item: str
+    question: str
+    files_examined: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Session:
-    """Everything `finalize` needs to diff against `port`'s output."""
+    """Everything `finalize` needs to diff against `port`'s output.
+
+    `paused_commit` / `paused_failed_files` / `remaining_commits` are set
+    when `port` stops mid-run because a commit's conflicts could not all
+    be auto-resolved: the resolved files were committed, the failed ones
+    left in the working tree, and `port --continue` will amend the manual
+    fixes into `paused_commit` and resume with `remaining_commits`.
+    """
 
     port_head_sha: str
     target_branch: str
@@ -68,7 +88,17 @@ class Session:
     source_commits: list[str] = field(default_factory=list)
     conflict_resolutions: list[ConflictResolution] = field(default_factory=list)
     gap_findings: list[GapFinding] = field(default_factory=list)
+    potential_gaps: list[PotentialGap] = field(default_factory=list)
     llm_usage: dict[str, Any] = field(default_factory=dict)
+    paused_commit: str = ""
+    paused_failed_files: list[str] = field(default_factory=list)
+    remaining_commits: list[str] = field(default_factory=list)
+    port_args: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def paused(self) -> bool:
+        """True when the session records a mid-run pause awaiting --continue."""
+        return bool(self.paused_commit)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,6 +111,9 @@ class Session:
             if isinstance(r, dict)
         ]
         findings = [GapFinding(**f) for f in data.get("gap_findings", []) if isinstance(f, dict)]
+        potential_gaps = [
+            PotentialGap(**p) for p in data.get("potential_gaps", []) if isinstance(p, dict)
+        ]
         return cls(
             port_head_sha=data["port_head_sha"],
             target_branch=data["target_branch"],
@@ -90,7 +123,12 @@ class Session:
             source_commits=list(data.get("source_commits", [])),
             conflict_resolutions=resolutions,
             gap_findings=findings,
+            potential_gaps=potential_gaps,
             llm_usage=dict(data.get("llm_usage", {})),
+            paused_commit=data.get("paused_commit", ""),
+            paused_failed_files=list(data.get("paused_failed_files", [])),
+            remaining_commits=list(data.get("remaining_commits", [])),
+            port_args=dict(data.get("port_args", {})),
         )
 
 

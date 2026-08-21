@@ -53,12 +53,19 @@ bpilot port <commits> <target-branch>
 │                    merge-commit detect)
 │
 ├─▶ Conflicts?
-│   ├─ yes ─▶ LLM Resolver (unified diff + verify, bounded retries)
-│   │         └─▶ Static Validator (no LLM)
-│   └─ no ──────────┐
-│                   ▼
+│   ├─ yes ─▶ LLM Resolver (complete-file rewrite + per-file validate
+│   │         as retry gate, bounded retries; LLM never runs git)
+│   └─ no ──────────┐       │   
+│                   ▼       ▼ 
+├─▶ Verification Checks (format + lint + unit tests,
+│    per SKILL.md "Verification Checks" section)
+│   └─▶ fail? ─▶ LLM Fixer (bounded loop, MAX 5 iterations:
+│                 gather failures → propose fixes → apply → re-run checks)
+│                 └─▶ still failing after 5 tries → surface in report,
+│                      leave branch for manual intervention
+│
 ├─▶ Gap Analyzer (checklist-driven, per SKILL.md "Things to Check")
-│    — runs ALWAYS: clean cherry-picks AND after conflict resolution
+│    — runs on the verified branch state
 │
 ├─▶ Gap fixes applied as labelled commits (bpilot(gap): ...)
 │
@@ -199,13 +206,13 @@ These invariants are non-negotiable and shape the implementation:
    │   │   ├── resolver.py         # conflict resolution (unified diff + verification)
    │   │   ├── validator.py        # static checks only (no LLM)
    │   │   ├── gap_analyzer.py     # checklist-driven gap analysis
-   │   │   ├── skill_loader.py     # parse bpilot/SKILL.md into sections
+   │   │   ├── skill_loader.py     # parse bpilot/skills/<name>/SKILL.md into a SkillSet
    │   │   └── report.py           # markdown report generation
    │   └── main.py                 # __main__ shim
    ├── tests/
    │   ├── unit/
    │   └── fixtures/
-   │       └── sample_skill.md
+   │       └── skills/             # 4 task skills + general-context, with frontmatter
    └── README.md
    ```
 
@@ -216,20 +223,41 @@ These invariants are non-negotiable and shape the implementation:
    - Expose `bpilot` command alias.
 
 4. **CLI skeleton** (`cli.py`):
-   ```python
-   import argparse
+    ```python
+    import argparse
 
-   def main():
-       parser = argparse.ArgumentParser(prog="bpilot", description="Intelligent backport helper")
-       parser.add_argument("commits", help="Commit hash or range (e.g. HEAD~3..HEAD or abc123)")
-       parser.add_argument("target", help="Target branch to backport onto")
-       parser.add_argument("--no-llm", action="store_true", help="Skip LLM inference; only cherry-pick")
-       parser.add_argument("--skill-file", default="bpilot/SKILL.md", help="Path to repo-specific skill file")
-       parser.add_argument("--model", default=None, help="Override configured model")
-       parser.add_argument("--dry-run", action="store_true", help="Don't create branches; just report")
-       args = parser.parse_args()
-       # ... dispatch
-   ```
+    def main():
+        parser = argparse.ArgumentParser(prog="bpilot", description="Intelligent backport helper")
+        sub = parser.add_subparsers(dest="command")
+
+        init = sub.add_parser("init", help="Scaffold bpilot/skills/ + .bpilot/, infer starter skills via LLM")
+        init.add_argument("--no-llm", action="store_true", help="Scaffold placeholders only; skip LLM inference")
+        init.add_argument("--skills-dir", default="bpilot/skills", help="Path to the skills directory")
+        init.add_argument("--model", default=None, help="Override configured model")
+
+        port = sub.add_parser("port")
+        port.add_argument("commits", help="Commit hash or range (e.g. HEAD~3..HEAD or abc123)")
+        port.add_argument("target", help="Target branch to backport onto")
+        port.add_argument("--no-llm", action="store_true", help="Skip LLM inference; only cherry-pick")
+        port.add_argument("--skills-dir", default="bpilot/skills", help="Path to the skills directory")
+        port.add_argument("--no-init", action="store_true", help="Do not scaffold bpilot/skills/ when absent")
+    port.add_argument("--model", default=None, help="Override configured model")
+    port.add_argument("--dry-run", action="store_true", help="Don't create branches; just report")
+    port.add_argument("--skip-baseline", action="store_true", help="Skip the baseline verification checks on the unmodified target branch")
+    args = parser.parse_args()
+    # ... dispatch
+    ```
+
+   `bpilot init` is the recommended first-run command: it scaffolds the
+   five starter `SKILL.md` files, creates `.bpilot/` + adds it to
+   `.gitignore`, and (when LLM is available) refines `verification-checks`
+   (from README / CONTRIBUTING.md / pyproject.toml) and `version-control`
+   (from README + git branch / commit history). The other three skills
+   are left as placeholders, learned over time via `finalize`. `port`'s
+   auto-init (placeholders only, no LLM) remains as a fallback. See
+   Phase 8 for the skills-directory layout and the [Agent Skills
+   specification](https://agentskills.io/specification) for the
+   frontmatter contract.
 
 ### Phase 2: Git Operations Layer
 
@@ -246,6 +274,9 @@ These invariants are non-negotiable and shape the implementation:
 9. **`get_backport_diff(target_branch)`** — after resolution, produces a full diff of the backport branch vs. target, for gap analysis.
 10. **`get_commit_messages(commits)`** — retrieves original commit messages for context.
 11. **`apply_patch(patch_text, allowed_files)`** — the only path by which LLM-produced text touches the tree. Validates with `git apply --check`, rejects patches touching files outside `allowed_files` (scope check), then applies and commits. Used by both the conflict resolver and the gap analyzer.
+12. **`stash_push()` / `stash_pop()`** — before the first cherry-pick, stash any uncommitted changes (the baseline / verification commands may regenerate build artifacts like `poetry.lock`, which would otherwise make `git cherry-pick` refuse to run). Popped after a successful run; on a pop conflict the backport's own regenerated version wins and the stash is dropped.
+
+**Dirty-tree auto-stash:** verification commands (e.g. `tox run -e format`) can leave regenerable artifacts dirty in the tree, which blocks cherry-pick. Rather than aborting (or forcing a manual stash + `--continue` round-trip), `port` auto-stashes before picking and auto-pops afterward. These files are regenerated by the post-pick validation step anyway, so the stashed copies are normally redundant; popping only matters for genuinely hand-edited changes, and on conflict the backport's version is authoritative.
 
 **Key design decision:** Shell out to `git` via `subprocess` rather than using `GitPython`. GitPython adds a heavy dependency and its API changes between versions. Shelling out is predictable, well-documented, and easy to debug.
 
@@ -331,7 +362,7 @@ These invariants are non-negotiable and shape the implementation:
    d. If verification fails, feed the error back to the LLM and retry (max 3 attempts).
    e. Continue the cherry-pick (`git cherry-pick --continue`).
 
-4. **If all retries fail:** Abort cherry-pick, leave the conflicted file in the working tree, and report the failure with the conflict markers for manual resolution.
+4. **If all retries fail for one or more files (partial failure):** The run *pauses* rather than aborting. Files that resolved successfully are committed (preserving the original commit message, via `git_ops.commit_partial_cherry_pick()`); files that failed are left in the working tree with their conflict markers. The session records the paused commit, the failed files, and any not-yet-picked commits. The report directs the user to resolve the failed files, `git add` them, and resume with `bpilot port --continue`, which amends the manual fixes into the paused commit and resumes the queue.
 
 ### Phase 6: Validator (static checks only)
 
@@ -344,6 +375,120 @@ These invariants are non-negotiable and shape the implementation:
    - Are there obvious placeholders like `TODO`, `FIXME`, `???` left by the LLM?
    - Does the diff introduce any unintended file changes (e.g., files not in the original commit)?
 3. **If validation fails:** Abort, report, and leave the branch in its current state for manual intervention.
+
+### Phase 6b: Verification Checks + LLM Fixer (format / lint / unit tests)
+
+**Deliverable:** `verification_fixer.py` — runs after the validator and (if
+present) after gap fixes are applied. Runs the project's format, lint, and
+unit-test commands (read from the SKILL.md **"Verification Checks"**
+section, falling back to **"Test Commands"**), and if any fail, invokes the
+LLM to repair the offending files in a bounded loop.
+
+1. **Verification check commands:** sourced from the SKILL.md "Verification
+   Checks" section (one command per line, e.g. `ruff format src/ tests/`,
+   `ruff check src/ tests/`, `pytest tests/unit/ -q`). If the section is
+   absent, the tool falls back to the legacy "Test Commands" section, then
+   to auto-detected defaults (`ruff check`, `ruff format --check`).
+
+2. **Loop (max 5 iterations):**
+   a. Run all verification check commands; capture stdout/stderr + exit code.
+   b. If all pass → done.
+   c. If any fail → collect the failing command output + the content of
+      the changed files referenced by the failures.
+   d. Send the failures + file contents to the LLM with a prompt asking
+      for the complete corrected file content for each affected file.
+      The LLM is text-in/text-out only; it never runs the checks itself.
+   e. Write the returned file contents to the working tree, re-run the
+      verification checks. Repeat.
+   f. After 5 iterations with remaining failures, stop, surface the
+      remaining failures in the report, and leave the branch for manual
+      intervention (the cherry-picked changes stay; the user fixes the
+      remaining lint/test failures manually).
+
+3. **Trust boundary:** Same as the resolver — the LLM returns file content;
+   the fixer writes it via normal file I/O and the validator re-checks
+   before staging. The LLM never runs shell commands, never sees git
+   credentials, and never executes the test suite itself.
+
+4. **Respects `--no-llm`:** verification checks still run (they're
+   deterministic), but the LLM fix loop is skipped on failure — failures
+   are just reported.
+
+   > Naming note: this step is called "verification checks" rather than
+   > "static checks" because the bundle includes **unit tests**, which
+   > execute the code and are therefore *dynamic*. The per-file validator
+   > in Phase 6 (conflict markers, syntax, placeholders) is genuinely
+   > static and keeps that name.
+
+5. **Baseline gate (default-on):** immediately after creating the backport
+   branch (off the freshly-fetched target) and **before any cherry-pick**,
+   `bpilot port` runs the verification checks on the untouched branch. The
+   baseline uses the same command resolution as the post-backport run
+   (skill "Verification Checks" → "Test Commands" fallback → auto-detected
+   ruff), so a missing `tox` and a broken target branch both surface here
+   — before a single cherry-pick or LLM token is spent.
+
+   - **On failure:** abort, clean up (restore the original branch, force-delete
+     the backport branch), and exit 1 with a triage message naming the three
+     possible causes: (a) missing dependencies in the current environment,
+     (b) wrong verification commands in the `verification-checks` skill (with
+     a note that `bpilot init`-inferred commands need human review), (c) the
+     target branch itself is broken. Each failing command is shown with its
+     exit code and the last 40 lines of combined output. No session file and
+     no `BACKPORT_REPORT.md` are written — nothing was backported. The backup
+     ref is left in place for manual recovery (HEAD never diverged from the
+     original branch).
+   - **Vacuously green when no commands exist:** with no skill and no
+     auto-detected commands, the baseline passes silently — current behaviour
+     for such repos is unchanged.
+   - **Runs regardless of LLM mode** (it's a deterministic gate); skipped by
+     `--dry-run` (which exits before branch creation) and by `--skip-baseline`.
+   - **Baseline-aware fixer:** when the baseline passed, the post-backport
+     fixer-loop LLM prompt asserts "these checks all passed on the unmodified
+     target branch immediately before the backport; the failures below were
+     introduced by the cherry-picked changes" — sharpening the fix mandate.
+     With `--skip-baseline` (`baseline_passed=False`), the assertion is
+     omitted and the fixer behaves as before. There is deliberately **no
+     per-command pre-existing-vs-new classification layer**: with a hard
+     baseline gate, any baseline failure aborts, so whenever the fixer
+     executes the baseline was green and every post-backport failure is new
+     by definition.
+
+   `--skip-baseline` is the sanctioned escape hatch for iterative runs (a
+   known-sane environment or a known-flaky target branch). The sanctioned
+   response to a persistently flaky target branch is `--skip-baseline`, **not**
+   editing the skill to delete the flaky command. Without a baseline,
+   post-backport check failures cannot be attributed to the backport.
+
+   > Working-tree side effects: the baseline checks run in the user's tree and
+   > may create `.tox/`, `.pytest_cache/`, coverage files, etc. — typically
+   > gitignored, the same as a human running the commands. Documented, not
+   > prevented.
+
+6. **Sanitized subprocess env (snap):** verification commands and lock
+   regeneration run with snap-injected environment variables stripped when
+   bpilot is running as a snap. bpilot ships as a classic-confined snap
+   bundling its own python3.12 and libraries; the snap wrapper injects
+   `LD_LIBRARY_PATH`, `PYTHONPATH`, `PYTHONHOME`, `VIRTUAL_ENV` (plus
+   `SNAP*`). Host binaries spawned with that environment can load the snap's
+   libraries and break in opaque ways. `validator.build_tool_env()` returns a
+   copy of `os.environ` with those four variables removed when `SNAP` is
+   present, and `None` (inherit unchanged) otherwise — so a developer's
+   deliberately exported `PYTHONPATH`/`VIRTUAL_ENV` outside the snap is
+   legitimate and untouched. Applied in exactly two places:
+   `run_verification_checks` and `_regen_locks`. Inline `VAR=value` prefixes
+   in a skill command (e.g. `PYTHONPATH=src:lib poetry run pytest`) still
+   take effect — they set the variable via the shell for that command only.
+   `git_ops._run` is deliberately **not** changed (the snap bundles its own
+   git).
+
+7. **Trust note (security):** the verification check commands are arbitrary
+   shell sourced from a repo-committed file (`bpilot/skills/verification-checks/
+   SKILL.md`), executed with the invoking user's privileges — the same trust
+   level as a `Makefile` or `tox.ini`. This is by design: the commands are how
+   the project verifies itself, and bpilot runs them verbatim. `bpilot init`-
+   inferred commands are guesses that require human review before they're
+   committed; the baseline triage message always reminds the user of this.
 
 ### Phase 7: Gap Analyzer (the key differentiator)
 
@@ -402,77 +547,163 @@ The gap analyzer is **checklist-driven**, not a generic "find problems" prompt. 
 
 5. **Gap analyzer respects `--no-llm`:** If set, skip entirely and note in report that gap analysis was skipped.
 
-### Phase 8: SKILL.md Format & Loading
+### Phase 8: Skills Directory Format & Loading
 
-**Deliverable:** A documented format for repo-specific knowledge, plus `skill_loader.py` that parses it into structured sections.
+**Deliverable:** A documented format for repo-specific knowledge, plus
+`skill_loader.py` that parses a directory of named skills. See
+`SKILLS_DIRECTORY_SPEC.md` for the full spec; this section is the summary.
 
-A `SKILL.md` file lives at `bpilot/SKILL.md` in the repository (or is specified via `--skill-file`). It is plain markdown with structured sections that the gap analyzer and conflict resolver read and include in LLM prompts.
+Repo-specific knowledge lives in a **directory of named skills**, each in
+its own subdirectory under `bpilot/skills/` containing a `SKILL.md`:
 
-**Loading (`skill_loader.py`):**
-- Parse the SKILL.md into named sections (e.g., "Branch Conventions", "Lifecycle Hooks", "Known Divergences", "Things to Check", "Test Commands").
-- Provide a `get_section(name)` API so each LLM call receives only the relevant sections, not the full file. This saves tokens and improves focus.
-- Extract the "Things to Check When Backporting" checklist as a list of items for the gap analyzer.
-- Extract "Test Commands" as a list of shell commands for the validator and gap fix verification.
-
-**Template:**
-```markdown
-# Backport Skill File: <repo-name>
-
-## Branch Conventions
-- `main` / `edge`: active development.
-- `8.4/edge`: release branch for 8.4.
-- `8.0/edge`: stable release branch for 8.0.
-- Backport branches: `backport/<feature>-to-<target>`
-
-## Lifecycle Hooks
-- **Machine charm:** `install` → `start` → `config-changed`. The `start`
-  hook calls `workload_initialise`. During charm upgrade (`juju refresh`),
-  `start` fires but is deferred by `_can_start` if `upgrade.idle` is False.
-  The upgrade framework handles workload lifecycle via `_on_upgrade_granted`
-  in `upgrade.py`.
-- **K8s charm:** `pebble_ready` fires on pod restart, which calls
-  `_reconcile_pebble_layer`. Pebble services with `startup: enabled` start
-  automatically on pod churn.
-
-## Upgrade Path
-- Machine charm upgrades: snap is refreshed in-place. The `start` hook is
-  deferred during upgrade. Any new "enable X by default" change must also
-  be added to `_on_upgrade_granted` in `upgrade.py` to take effect on
-  existing deployments.
-- K8s charm upgrades: pod restarts → `pebble_ready` → services reconcile.
-
-## Things to Check When Backporting
-1. **Hook coverage on machine charm:** If the original PR added behaviour
-   to `workload_initialise` (runs under `start`), check whether
-   `_on_upgrade_granted` in `upgrade.py` needs the same call — because
-   `start` is deferred during charm upgrades by the `upgrade.idle` guard
-   in `_can_start`.
-2. **K8s vs machine parity:** If the original PR touched both `kubernetes/`
-   and `machines/`, verify the K8s side doesn't need a separate fix — K8s
-   uses pebble layers, not snap services.
-
-## Test Commands
-- Unit tests: `PYTHONPATH=src:lib poetry run pytest tests/unit/ -q`
-- Lint: `poetry run ruff check src/ tests/`
-- Format check: `poetry run ruff format --check --diff src/ tests/`
-
-## Known Divergences Between Branches
-- 8.4 `workload_initialise` has an `is_data_dir_initialised()` shortcut
-  branch; 8.0 does not.
-- 8.4 uses `charmed-stats` as monitoring username; 8.0 uses `monitoring`.
-- 8.4 `_on_set_password` doesn't guard exporter restart on `has_cos_relation`;
-  8.0 had the guard (must be removed when backporting).
-
-## Files of Interest
-- `machines/src/charm.py` — main charm logic, hooks, workload_initialise.
-- `machines/src/upgrade.py` — upgrade handling, `_on_upgrade_granted`.
-- `machines/lib/charms/mysql/v0/mysql.py` — shared MySQL library.
-- `machines/tests/unit/test_charm.py` — unit tests for charm.
+```
+bpilot/
+└── skills/
+    ├── version-control/SKILL.md
+    ├── verification-checks/SKILL.md
+    ├── conflict-resolution/SKILL.md
+    ├── gap-analysis/SKILL.md
+    └── general-context/SKILL.md   # shared, cross-cutting sections
 ```
 
-**Why this works:** The SKILL.md is essentially the kind of context a senior engineer would explain to a junior engineer doing their first backport. It captures the *tacit knowledge* that git can't see. The gap analyzer feeds this to the LLM as grounding context.
+The set of skills is fixed (4 task skills + `general-context`). Each
+`SKILL.md` conforms to the [Agent Skills
+specification](https://agentskills.io/specification): YAML frontmatter
+(required `name` matching the parent directory, and `description`) followed
+by a markdown body of `## Section` headers.
 
-**Maintenance:** The SKILL.md is strictly manually maintained by human experts. It represents the kind of context a senior engineer would explain to a junior engineer doing their first backport. The tool never modifies it automatically. Keeping it accurate and current is the repository maintainer's responsibility.
+**Section → skill mapping** (current single-file sections redistribute as):
+
+| Section                                | New skill            |
+|----------------------------------------|----------------------|
+| Branch Conventions / Commit Conventions| version-control      |
+| Verification Checks / Test Commands     | verification-checks  |
+| Skip Files / Merge Conflict Resolution Rules | conflict-resolution |
+| Things to Check When Backporting       | gap-analysis         |
+| Lifecycle Hooks / Upgrade Path / Files of Interest / Known Divergences | general-context |
+
+The shared `general-context` skill is auto-appended to every task's
+context (callers do not pass it explicitly) because several of its
+sections are read by more than one task.
+
+**Loading (`skill_loader.py`):**
+- `load_skill_set(skills_dir)` loads every `bpilot/skills/<name>/SKILL.md`
+  into a `SkillSet`; returns `None` when the directory is absent (graceful
+  degradation). A present-but-malformed skill file (missing `name` /
+  `description`, name/directory mismatch, malformed name) raises
+  `SkillLoadError` — a hard error, not silent degradation.
+- `SkillSet.get(name)` returns a named `SkillFile`; `SkillSet.context_for(*names)`
+  concatenates the named skills' bodies AND `general-context`, skipping
+  empty/absent skills and stripping HTML-comment placeholders so
+  scaffolding stubs never reach the LLM. Returns "" when all are empty.
+- `SkillFile.is_empty` is True for freshly-scaffolded files (body has no
+  non-whitespace, non-HTML-comment content). Consumers MUST omit the
+  skill-context block from LLM prompts when all relevant skills are empty,
+  so a first run against freshly-scaffolded skills produces LLM prompts
+  identical to the no-skills-directory graceful-degradation path.
+- `checklist_items` (gap-analysis), `verification_checks`
+  (verification-checks, falling back to legacy `Test Commands`), and
+  `skip_files` (conflict-resolution) all return `[]` on an empty skill.
+
+**First-run auto-init:** when `bpilot port` is run from a repo root with no
+`bpilot/skills/` directory, bpilot scaffolds the directory and writes the
+five starter `SKILL.md` files (valid frontmatter + empty section bodies
+with `<!-- ... -->` placeholders) before proceeding. `--no-init`
+suppresses scaffolding (for CI/bot runs that shouldn't write files).
+`bpilot port --dry-run` still triggers scaffolding. `finalize` does NOT
+auto-init (it requires an existing session, which implies `port` already
+ran); `reset` does NOT touch the skills directory. There is no separate
+`bpilot init` subcommand — the command surface stays `port`, `finalize`,
+`reset`.
+
+**Starter templates** (written by `init_skills_dir`):
+
+`bpilot/skills/version-control/SKILL.md`:
+```markdown
+---
+name: version-control
+description: Repo-specific branch and commit-message conventions for backports. Used by bpilot to name backport branches and to validate commit message style when porting.
+---
+## Branch Conventions
+<!-- e.g. `main` / `edge`: active development. `8.4/edge`: release branch. -->
+
+## Commit Conventions
+<!-- e.g. conventional-commits, ticket prefixes, sign-off requirements. -->
+```
+
+`bpilot/skills/verification-checks/SKILL.md`:
+```markdown
+---
+name: verification-checks
+description: Format, lint, and unit-test commands to run after a backport. Used by bpilot to verify a ported change and to drive the LLM repair loop on failure.
+---
+## Verification Checks
+<!-- One command per line, backtick-wrapped. -->
+<!-- e.g. Format: `ruff format src/ tests/` -->
+<!-- e.g. Lint:   `ruff check src/ tests/` -->
+<!-- e.g. Tests:  `PYTHONPATH=src poetry run pytest tests/unit/ -q` -->
+
+## Test Commands
+<!-- Legacy alias for Verification Checks; used only if the section above is empty. -->
+```
+
+`bpilot/skills/conflict-resolution/SKILL.md`:
+```markdown
+---
+name: conflict-resolution
+description: Known branch divergences and project-specific rules for resolving cherry-pick conflicts. Used by bpilot's resolver when a port produces a conflict.
+---
+## Skip Files
+<!-- Glob patterns to skip during conflict resolution (target version taken instead). -->
+<!-- e.g. poetry.lock, *.lock, package-lock.json, Cargo.lock, go.sum -->
+
+## Merge Conflict Resolution Rules
+<!-- Project-specific guidance the LLM should follow when resolving conflicts. -->
+```
+
+`bpilot/skills/gap-analysis/SKILL.md`:
+```markdown
+---
+name: gap-analysis
+description: Checklist of things to verify when backporting (lifecycle hooks, upgrade paths, parity between flavours). Used by bpilot's gap analyzer to drive per-item checks.
+---
+## Things to Check When Backporting
+<!-- Numbered list; each item becomes one targeted LLM query. -->
+<!-- 1. If the original PR added behaviour to X, check whether Y also needs it. -->
+```
+
+`bpilot/skills/general-context/SKILL.md`:
+```markdown
+---
+name: general-context
+description: Shared repo context read by multiple bpilot tasks — lifecycle hooks, upgrade paths, files of interest, known branch divergences. Loaded alongside each task-specific skill.
+---
+## Lifecycle Hooks
+<!-- e.g. install → start → config-changed; start calls workload_initialise. -->
+
+## Upgrade Path
+<!-- e.g. machine charm upgrades defer start; new "enable X by default" changes must also be added to _on_upgrade_granted. -->
+
+## Known Divergences Between Branches
+<!-- e.g. 8.4 workload_initialise has an is_data_dir_initialised() shortcut; 8.0 does not. -->
+
+## Files of Interest
+<!-- e.g. machines/src/charm.py — main charm logic. -->
+```
+
+**Why this works:** The skills are essentially the kind of context a
+senior engineer would explain to a junior engineer doing their first
+backport. They capture the *tacit knowledge* that git can't see. The gap
+analyzer feeds this to the LLM as grounding context, and each task loads
+only the skill(s) it needs by name — no parsing a monolithic file and
+selecting sections.
+
+**Maintenance:** The skill files are strictly manually maintained by
+human experts. The tool never modifies them automatically (`finalize`
+only *proposes* updates). Keeping them accurate and current is the
+repository maintainer's responsibility. `finalize` never proposes edits
+to `version-control` or `verification-checks` — those are
+conventions/config, not learned from per-backport deltas.
 
 ### Phase 9: Report Generator
 
@@ -496,10 +727,16 @@ A `SKILL.md` file lives at `bpilot/SKILL.md` in the repository (or is specified 
   - `machines/tests/unit/test_charm.py` (test signature mismatch)
 
 ## Validation
+- ✅ no conflict markers in changed files
+- ✅ all changed Python files parse
+
+## Verification Checks (format / lint / unit tests)
+- ✅ `ruff format --check` passed
 - ✅ `ruff check` passed
-- ✅ `pytest tests/unit/test_charm.py` — 32 passed
 - ⚠️ `pytest tests/unit/test_upgrade.py` — 1 failed
-  (gap analyzer flagged missing upgrade.py change — see below)
+  → LLM fixer attempted 2 iterations; remaining failure surfaced for manual review
+  (the Gap Analysis below subsequently identifies the missing upgrade-path
+  call as the likely cause; applying that gap fix would resolve this test)
 
 ## Gap Analysis
 ### Gap 1: Missing `connect_mysql_exporter` in upgrade path
@@ -558,7 +795,27 @@ This mode is useful for:
    - **Rejected suggestions** — gap findings the user dropped (bpilot may have been wrong, or the gap wasn't real).
    - **Human-added changes** — commits/hunks in the diff that don't correspond to any recorded gap fix.
 
-4. **Propose SKILL.md updates (LLM, only if human-added changes exist):**
+4. **Propose per-skill updates (LLM, only if human-added changes exist):**
+
+   With the multi-skill layout (Phase 8), finalize proposes per-skill diffs
+   against the **correct** skill file(s) based on what the human-added
+   changes look like:
+   - New "Things to Check" entries → propose an update to
+     `bpilot/skills/gap-analysis/SKILL.md`.
+   - New "Known Divergences", lifecycle hooks, upgrade paths, or files of
+     interest → propose an update to `bpilot/skills/general-context/SKILL.md`.
+   - New conflict-resolution rules or skip-file patterns → propose an
+     update to `bpilot/skills/conflict-resolution/SKILL.md`.
+   - **Never** propose updates to `version-control` or
+     `verification-checks` — those are conventions/config, not learned
+     from per-backport deltas. The prompt names this as a hard constraint.
+
+   The finalize LLM prompt receives the existing content of the candidate
+   target skill file(s) (`gap-analysis`, `general-context`,
+   `conflict-resolution` only), is told the structure (which sections live
+   in which skill) so it targets the right file, and emits one unified
+   diff per skill file it wants to update.
+
    ```
    A backport was performed from <source> to <target>. The tool
    suggested gap fixes; the human's final merged result differed.
@@ -570,22 +827,27 @@ This mode is useful for:
    Applied suggestions: <list>
    Rejected suggestions: <list>
 
-   Current SKILL.md:
-   <content>
+   Existing skills (gap-analysis / general-context / conflict-resolution):
+   <contents of those three SKILL.md files>
 
-   Propose minimal updates to the SKILL.md "Things to Check When
-   Backporting" and "Known Divergences" sections that would have let
-   the tool catch these human-added changes itself next time. Do not
-   duplicate existing entries. Output a unified diff against SKILL.md.
+   Propose minimal updates to the relevant skill file(s) that would
+   have let the tool catch these human-added changes itself next time.
+   Do not duplicate existing entries. Output one unified diff per skill
+   file you want to update. Do NOT propose updates to version-control
+   or verification-checks — those are read-only for finalize.
    ```
 
 5. **Output:**
    - Print the classification summary (applied / rejected / human-added).
-   - Print the proposed SKILL.md diff for review.
-   - With `--commit`: apply the diff and commit it as `chore(bpilot): update SKILL.md from backport learnings`. Without: leave the diff for the user to apply manually.
-   - With `--no-llm`: print the classification and diff, skip the SKILL.md suggestion step.
+   - Print the proposed per-skill diff(s) for review.
+   - With `--commit`: apply each proposed diff as **one commit per updated
+     skill** (e.g. `chore(bpilot): update gap-analysis skill from backport
+     learnings`), mirroring the per-gap-fix commit philosophy in Phase 7.
+     Without `--commit`: leave the diffs for the user to apply manually.
+   - With `--no-llm`: print the classification and diff, skip the
+     skill-update suggestion step.
 
-6. **Why this matters:** each human correction that bpilot missed becomes a candidate checklist item for the next backport — but only after a human reviews and accepts the SKILL.md update. The skill file converges toward a comprehensive, team-vetted map of branch divergences.
+6. **Why this matters:** each human correction that bpilot missed becomes a candidate checklist item for the next backport — but only after a human reviews and accepts the skill update. The skill files converge toward a comprehensive, team-vetted map of branch divergences. One commit per updated skill keeps each update independently reviewable and revertible.
 
 ## CLI UX Summary
 
@@ -594,20 +856,25 @@ This mode is useful for:
 sudo snap set bpilot openrouter-api-key="sk-or-..."
 sudo snap set bpilot model="openrouter/z-ai/glm-5.2"
 
+# --- init (first-run per project) ---
+bpilot init                              # scaffold bpilot/skills/ + .bpilot/, infer verification-checks & version-control via LLM
+bpilot init --no-llm                     # scaffold placeholders only (no LLM inference)
+
 # --- port ---
-bpilot port abc123 8.0/edge                    # single commit
+bpilot port abc123 8.0/edge                    # single commit (auto-scaffolds bpilot/skills/ on first run)
 bpilot port HEAD~3..HEAD 8.0/edge              # commit range
 bpilot port abc123 8.0/edge --no-llm           # mechanical only
-bpilot port abc123 8.0/edge --skill-file ./docs/SKILL.md
-bpilot port abc123 8.0/edge --dry-run          # show diff, no branch
+bpilot port abc123 8.0/edge --no-init          # do not scaffold bpilot/skills/ when absent
+bpilot port abc123 8.0/edge --skills-dir ./docs/skills  # override skills directory
+bpilot port abc123 8.0/edge --dry-run          # show diff, no branch (still scaffolds)
 bpilot port abc123 8.0/edge --model openrouter/anthropic/claude-3.5-sonnet
 
 # review bpilot's work (incl. labelled bpilot(gap): commits), edit, run tests
 
 # --- finalize ---
-bpilot finalize                                # classify delta + propose SKILL.md updates
-bpilot finalize --commit                       # also commit the SKILL.md suggestion
-bpilot finalize --no-llm                       # classification only, no SKILL.md suggestion
+bpilot finalize                                # classify delta + propose per-skill updates
+bpilot finalize --commit                       # also commit each proposed skill update (one commit per skill)
+bpilot finalize --no-llm                       # classification only, no skill suggestion
 ```
 
 ## GitHub Bot Integration (comment-driven)

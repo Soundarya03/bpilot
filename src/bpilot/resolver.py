@@ -27,19 +27,15 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bpilot.git_ops import GitError, get_conflict_info, get_file_content
+from bpilot.git_ops import GitError, get_commit_diff, get_conflict_info, get_file_content
 from bpilot.llm_client import LLMClient
-from bpilot.skill_loader import SkillFile
+from bpilot.skill_loader import SkillSet
 from bpilot.validator import validate_file
 
 MAX_RETRIES = 3
 
-# SKILL.md sections most relevant to conflict resolution.
-_RELEVANT_SECTIONS = [
-    "Branch Conventions",
-    "Known Divergences Between Branches",
-    "Lifecycle Hooks",
-]
+# Skill name holding conflict-resolution rules + skip-file patterns.
+_CONFLICT_SKILL = "conflict-resolution"
 
 
 @dataclass
@@ -74,7 +70,7 @@ def resolve_conflicts(
     target_branch: str,
     commit_message: str,
     llm: LLMClient,
-    skill: SkillFile | None,
+    skill_set: SkillSet | None,
     cwd: Path,
 ) -> ResolutionResult:
     """Resolve all conflicts for a single cherry-pick via the LLM.
@@ -85,11 +81,19 @@ def resolve_conflicts(
     If any file cannot be resolved after MAX_RETRIES, the cherry-pick is
     left in its conflicted state for manual intervention — the caller
     (CLI) decides whether to abort or hand off.
+
+    Skill context comes from the `conflict-resolution` + `general-context`
+    skills (loaded by name from `skill_set`). Skip-file patterns come
+    from the `conflict-resolution` skill's "Skip Files" section.
     """
     result = ResolutionResult(commit=commit)
 
-    skill_context = _build_skill_context(skill)
-    skip_patterns = skill.skip_files if skill else []
+    skill_context = _build_skill_context(skill_set)
+    skip_patterns: list[str] = []
+    if skill_set is not None:
+        conflict_skill = skill_set.get(_CONFLICT_SKILL)
+        if conflict_skill is not None:
+            skip_patterns = conflict_skill.skip_files
 
     for file_path in conflicted_files:
         if _should_skip(file_path, skip_patterns):
@@ -109,6 +113,7 @@ def resolve_conflicts(
         print(f"  resolving {file_path} ...")
         attempt_result = _resolve_single_file(
             file_path=file_path,
+            commit=commit,
             target_branch=target_branch,
             commit_message=commit_message,
             llm=llm,
@@ -132,6 +137,7 @@ def resolve_conflicts(
 def _resolve_single_file(
     *,
     file_path: str,
+    commit: str,
     target_branch: str,
     commit_message: str,
     llm: LLMClient,
@@ -145,6 +151,14 @@ def _resolve_single_file(
       2. Ask the LLM for the complete resolved file content.
       3. Write it to the working tree and validate (markers, syntax, etc.).
       4. On failure, feed the error back for the next attempt.
+
+    The prompt carries the incoming commit's per-file diff so the LLM can
+    tell which side of the markers is intentional change vs. target-side
+    divergence. After validation passes, a deterministic guard checks
+    that lines the incoming commit ADDED survived the resolution; a miss
+    is fed back as an error unless the LLM already repeated the same
+    omission once (treated as a deliberate choice, accepted with a
+    stderr note).
     """
     conflict_info = get_conflict_info(file_path, cwd=cwd)
 
@@ -154,7 +168,17 @@ def _resolve_single_file(
     except GitError:
         target_content = "(file does not exist on target branch)"
 
+    # The incoming commit's per-file diff — grounds both the prompt and
+    # the dropped-additions guard. Degrade to "" when uncomputable
+    # (e.g. test doubles with fake SHAs); the guard then no-ops.
+    try:
+        incoming_diff = get_commit_diff(commit, file_path, cwd=cwd)
+    except GitError:
+        incoming_diff = ""
+    incoming_additions = _diff_additions(incoming_diff)
+
     last_error = ""
+    warned_missing: tuple[str, ...] | None = None
 
     for attempt_num in range(1, MAX_RETRIES + 1):
         prompt = _build_prompt(
@@ -163,6 +187,7 @@ def _resolve_single_file(
             target_content=target_content,
             target_branch=target_branch,
             commit_message=commit_message,
+            incoming_diff=incoming_diff,
             skill_context=skill_context,
             previous_error=last_error,
             attempt=attempt_num,
@@ -193,6 +218,28 @@ def _resolve_single_file(
             last_error = "; ".join(validation.errors)
             continue
 
+        # Dropped-additions guard: every line the incoming commit added
+        # should survive the resolution. Missing lines are fed back once;
+        # an identical omission on the next attempt is treated as
+        # deliberate (bounded loop guarantee) and accepted with a note.
+        missing = _missing_additions(incoming_additions, resolved_content)
+        if missing:
+            missing_key = tuple(missing)
+            if warned_missing != missing_key:
+                warned_missing = missing_key
+                last_error = (
+                    "your resolution dropped lines the incoming commit adds:\n"
+                    + "\n".join(f"  {m}" for m in missing)
+                    + "\nInclude them unless they truly conflict with the "
+                    "target branch's own lines."
+                )
+                continue
+            print(
+                f"    note: {file_path} resolution omits incoming lines "
+                f"(LLM confirmed after feedback): {missing}",
+                file=sys.stderr,
+            )
+
         # Success: stage the resolved file.
         try:
             _stage_file(file_path, cwd=cwd)
@@ -214,6 +261,26 @@ def _resolve_single_file(
     )
 
 
+def _diff_additions(diff: str) -> list[str]:
+    """Extract the added lines of a unified diff (stripped, non-empty).
+
+    Powers the deterministic guard that keeps the LLM from silently
+    dropping changes the incoming commit introduces.
+    """
+    additions: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            stripped = line[1:].strip()
+            if stripped:
+                additions.append(stripped)
+    return additions
+
+
+def _missing_additions(additions: list[str], resolved_content: str) -> list[str]:
+    """Return the incoming additions absent (as substrings) from the resolution."""
+    return [a for a in additions if a not in resolved_content]
+
+
 def _stage_file(file_path: str, *, cwd: Path) -> None:
     """Stage a resolved file so cherry-pick --continue can proceed."""
     import subprocess
@@ -230,8 +297,11 @@ def _stage_file(file_path: str, *, cwd: Path) -> None:
 _SYSTEM_PROMPT = (
     "You are an expert at resolving git merge conflicts during backports. "
     "You produce the complete resolved file content, with all conflict "
-    "markers removed. You preserve the original commit's intent while "
-    "adapting to the target branch's structure. "
+    "markers removed. When the two sides of a conflict differ, you MERGE "
+    "them: keep the target branch's own lines AND the incoming commit's "
+    "changes, and never silently drop either side. You preserve the "
+    "original commit's intent while adapting to the target branch's "
+    "structure. "
     "You output ONLY the file content, with no explanations or markdown fences."
 )
 
@@ -267,11 +337,17 @@ def _build_prompt(
     target_content: str,
     target_branch: str,
     commit_message: str,
-    skill_context: str,
-    previous_error: str,
-    attempt: int,
+    incoming_diff: str = "",
+    skill_context: str = "",
+    previous_error: str = "",
+    attempt: int = 1,
 ) -> str:
     """Construct the LLM prompt for a single conflict resolution attempt.
+
+    `incoming_diff` is the commit's per-file diff vs. its first parent —
+    the clearest possible statement of what the incoming commit changed,
+    so the LLM can tell intentional incoming change from target-side
+    divergence and doesn't silently drop one side.
 
     If `previous_error` is non-empty, it's included so the LLM can
     correct its previous failed attempt.
@@ -281,19 +357,35 @@ def _build_prompt(
         "",
         f"Target branch: {target_branch}",
         f"Original commit message: {commit_message}",
-        "",
-        f"File with conflict: {file_path}",
-        "",
-        "Conflict content (working tree, with markers):",
-        "```",
-        conflict_content,
-        "```",
-        "",
-        "Target branch's version of this file (before cherry-pick):",
-        "```",
-        target_content,
-        "```",
     ]
+
+    if incoming_diff:
+        parts.extend(
+            [
+                "",
+                "The incoming commit's change to this file (diff vs. its parent):",
+                "```diff",
+                incoming_diff,
+                "```",
+            ]
+        )
+
+    parts.extend(
+        [
+            "",
+            f"File with conflict: {file_path}",
+            "",
+            "Conflict content (working tree, with markers):",
+            "```",
+            conflict_content,
+            "```",
+            "",
+            "Target branch's version of this file (before cherry-pick):",
+            "```",
+            target_content,
+            "```",
+        ]
+    )
 
     if skill_context:
         parts.extend(
@@ -320,9 +412,11 @@ def _build_prompt(
         [
             "",
             "Produce the COMPLETE resolved file content. Remove all "
-            "conflict markers (<<<<<<<, =======, >>>>>>>). Preserve the "
-            "intent of the original commit while adapting to the target "
-            "branch's structure.",
+            "conflict markers (<<<<<<<, =======, >>>>>>>). MERGE the two "
+            "sides: keep the target branch's own lines AND the incoming "
+            "commit's changes — never silently drop either side. Preserve "
+            "the intent of the original commit while adapting to the "
+            "target branch's structure.",
             "",
             "Output ONLY the file content. No explanations, no markdown fences, no diff markers.",
         ]
@@ -331,15 +425,18 @@ def _build_prompt(
     return "\n".join(parts)
 
 
-def _build_skill_context(skill: SkillFile | None) -> str:
-    """Extract the SKILL.md sections relevant to conflict resolution.
+def _build_skill_context(skill_set: SkillSet | None) -> str:
+    """Extract the skill context relevant to conflict resolution.
 
-    Returns an empty string if no skill file is available — the resolver
-    still works, just with less grounding context.
+    Concatenates the `conflict-resolution` and `general-context` skill
+    bodies (skipping any that are empty or absent). Returns "" if no
+    usable skill context is available — the resolver still works, just
+    with less grounding context, and the LLM prompt omits the
+    skill-context block entirely.
     """
-    if skill is None:
+    if skill_set is None:
         return ""
-    return skill.get_sections(_RELEVANT_SECTIONS)
+    return skill_set.context_for(_CONFLICT_SKILL)
 
 
 def _should_skip(file_path: str, patterns: list[str]) -> bool:
@@ -351,12 +448,18 @@ def _resolve_by_checkout(file_path: str, *, target_branch: str, cwd: Path) -> No
     """Resolve a conflict by taking the target branch's version.
 
     Used for files in the SKILL.md "Skip Files" section (e.g. lock files)
-    that should be regenerated by the user rather than merged by the LLM.
+    that should be regenerated by bpilot's validator rather than merged by
+    the LLM.
+
+    NOTE: during a cherry-pick conflict, `--ours` is the branch being
+    cherry-picked ONTO (HEAD, i.e. the target branch) and `--theirs` is
+    the commit being picked (the source change) — the reverse of merge
+    intuition. Keeping the target version therefore requires `--ours`.
     """
     import subprocess
 
     subprocess.run(
-        ["git", "checkout", "--theirs", file_path],
+        ["git", "checkout", "--ours", file_path],
         cwd=cwd,
         check=True,
         capture_output=True,
