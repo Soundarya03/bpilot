@@ -5,8 +5,8 @@ mechanical parts of backporting (fetch, branch, cherry-pick) and adds
 an LLM-assisted layer for conflict resolution and semantic gap analysis.
 
 The LLM is a pure text-in/text-out function. It never sees git
-credentials and never executes anything — all repo mutation goes
-through the deterministic git-ops layer. bpilot never merges.
+credentials and never executes anything, all repo mutation goes
+through the deterministic git-ops layer. Also, bpilot never merges.
 
 ## Usage
 
@@ -18,6 +18,28 @@ bpilot port <commit(s)> <target>           # backport commits from current branc
 bpilot finalize                            # optional; propose SKILL.md updates from a finished backport
 bpilot reset                               # discard session at any point in time during porting, return to original branch
 ```
+
+### API key setup
+
+bpilot uses [OpenRouter](https://openrouter.ai) for LLM inference. Get
+an API key from your OpenRouter dashboard, then provide it via one of:
+
+**Environment variable** (works everywhere — local dev, CI, GitHub
+Actions):
+
+```bash
+export OPENROUTER_API_KEY="sk-or-..."
+```
+
+**Snap config** (when running the snap; persists across sessions):
+
+```bash
+sudo snap set bpilot openrouter-api-key="sk-or-..."
+```
+
+Without a key, bpilot falls back to `--no-llm` mode: mechanical
+cherry-pick only, no conflict resolution, no gap analysis. The
+`--no-llm` flag forces this regardless of key availability.
 
 ### `bpilot init`
 
@@ -45,7 +67,6 @@ LLM-inferred starter content.
 bpilot port abc123 8.0/edge                # single commit
 bpilot port HEAD~3..HEAD 8.0/edge          # commit range
 bpilot port abc123 8.0/edge --no-llm       # mechanical cherry-pick only
-bpilot port abc123 8.0/edge --dry-run      # show what would happen (still scaffolds)
 bpilot port abc123 8.0/edge --skip-baseline # skip the pre-cherry-pick baseline checks
 bpilot port abc123 8.0/edge --no-fetch     # skip fetching; use the local target ref as-is
 bpilot port --continue                      # resume a paused run after manual conflict fixes
@@ -91,28 +112,6 @@ Always human-reviewed; never auto-applied to a skill file.
 Abort any in-progress cherry-pick, switch back to the original branch,
 force-delete the backport branch, and remove any session files (`.bpilot/` and
 `BACKPORT_REPORT.md`).
-
-## API key setup
-
-bpilot uses [OpenRouter](https://openrouter.ai) for LLM inference. Get
-an API key from your OpenRouter dashboard, then provide it via one of:
-
-**Environment variable** (works everywhere — local dev, CI, GitHub
-Actions):
-
-```bash
-export OPENROUTER_API_KEY="sk-or-..."
-```
-
-**Snap config** (when running the snap; persists across sessions):
-
-```bash
-sudo snap set bpilot openrouter-api-key="sk-or-..."
-```
-
-Without a key, bpilot falls back to `--no-llm` mode: mechanical
-cherry-pick only, no conflict resolution, no gap analysis. The
-`--no-llm` flag forces this regardless of key availability.
 
 ## Configure bpilot
 
@@ -160,86 +159,18 @@ Point bpilot at a non-default location with `--skills-dir`.
 
 ## Swimlane diagram
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                  bpilot port                                │
-├──────────────┬──────────────┬──────────────┬──────────────┬─────────────────┤
-│  Git ops     │  Resolver    │  Verifier    │  Gap analyzer│  Snapshot       │
-│              │  (LLM)       │  + Fixer     │  (LLM)       │  + Report       │
-├──────────────┼──────────────┼──────────────┼──────────────┼─────────────────┤
-│ fetch target │              │              │              │                 │
-│ backup ref   │              │              │              │                 │
-│ create branch│              │              │              │                 │
-│ ↓            │              │              │              │                 │
-│ baseline     │              │  baseline    │              │                 │
-│ verification │              │  green?      │              │                 │
-│ ↓            │              │  (fail → abort)             │                 │
-│ cherry-pick  │              │              │              │                 │
-│ each commit  │              │              │              │                 │
-│ ↓            │              │              │              │                 │
-│ conflict?    │              │              │              │                 │
-│  yes ────────┼─────────────▶│              │              │                 │
-│              │ resolve file │              │              │                 │
-│              │ validate     │              │              │                 │
-│              │ retry × 3    │              │              │                 │
-│  no ─────────┼──────────────┼─────────────▶│              │                 │
-│              │              │ run checks   │              │                 │
-│              │              │ (format/lint/│              │                 │
-│              │              │  unit tests) │              │                 │
-│              │              │  fail? ──────┼─────────────▶│                 │
-│              │              │              │ propose fix  │                 │
-│              │              │              │ validate     │                 │
-│              │              │              │ retry × 5    │                 │
-│              │              │  green ───────┼──────────────┼────────────────▶│
-│              │              │              │              │ analyze per     │
-│              │              │              │              │ checklist item  │
-│              │              │              │              │ (explore files) │
-│              │              │              │              │  applies → fix  │
-│              │              │              │              │  + commit       │
-│              │              │              │              │  `bpilot(gap):` │
-│              │              │              │              │  uncertain →    │
-│              │              │              │              │  potential gap  │
-│              │              │              │              │  ↓               │
-│              │              │ re-run checks│              │                 │
-│              │              │ once (no LLM)│              │                 │
-│              │              │  ────────────┼──────────────┼────────────────▶│
-│              │              │              │              │ write session   │
-│              │              │              │              │ + BACKPORT_     │
-│              │              │              │              │   REPORT.md     │
-└──────────────┴──────────────┴──────────────┴──────────────┴─────────────────┘
+![img.png](img.png)
 
-                        ⟦ human reviews, edits, tests ⟧
+![img_2.png](img_2.png)
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                bpilot finalize                              │
-├──────────────────┬──────────────────┬──────────────────┬───────────────────┤
-│  Load session    │  Diff vs port    │  Classify        │  Propose          │
-│                  │  end state       │                  │  SKILL.md updates │
-├──────────────────┼──────────────────┼──────────────────┼───────────────────┤
-│ read .bpilot/    │                  │                  │                   │
-│   session.json   │                  │                  │                   │
-│ ↓                │                  │                  │                   │
-│                  │ git diff         │ applied /        │ LLM refines       │
-│                  │ port_head_sha    │ rejected /       │ skill files from  │
-│                  │ vs. HEAD         │ human-added      │ human-added edits │
-│                  │                  │                  │                   │
-│                  │                  │                  │ human reviews,    │
-│                  │                  │                  │ commits, raises   │
-│                  │                  │                  │ PR                │
-└──────────────────┴──────────────────┴──────────────────┴───────────────────┘
-```
+## WIP: GitHub Actions workflow
 
-## Future: GitHub bot
-
-The CLI is transport-agnostic; the same `port` / `finalize` flows will
-be drivable from a GitHub bot via PR comments. Planned commands:
+The same `port` / `finalize` can be invoked via PR comments. Planned commands:
 
 - `/port <commits> <target>` — open a draft backport PR.
-- `/finalize` — propose SKILL.md updates on a finished backport PR.
+- `/finalize` — propose SKILL.md updates on an open backport PR.
 
 The bot carries the session snapshot as a hidden HTML comment embedded
 in the PR body (the `session.py` (de)serialisation and PR-body
-transport already exist). The trust boundary is unchanged: the LLM
-still never runs git, never writes files directly, and never executes
-anything — all mutation goes through the git-ops layer. The bot only
+transport already exist). The gh-actions bot only
 opens draft PRs; it never merges.

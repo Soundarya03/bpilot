@@ -16,12 +16,24 @@ confinement: classic
 
 apps:
   bpilot:
-    command: bin/bpilot
+    # Invoke the venv python explicitly rather than relying on the script's
+    # shebang. The poetry plugin generates `bin/bpilot` with shebang
+    # `#!/usr/bin/env python3`; under classic confinement `snap run` does not
+    # put $SNAP/bin on PATH, so that shebang resolves to the host python,
+    # which can't see the venv's site-packages (ModuleNotFoundError: bpilot).
+    # `$SNAP/bin/python3` self-activates the venv via pyvenv.cfg and finds the
+    # installed package. This also keeps host PATH untouched for a classic snap.
+    command: bin/python3 $SNAP/bin/bpilot
 
 parts:
   bpilot:
     plugin: poetry
     source: .
+    # Use a git checkout rather than a raw directory copy. Cloning from .git
+    # reads committed objects only, so it never touches unreadable files left
+    # in the working tree (e.g. stray temp files a broken VM mount can't even
+    # stat). Build only what's tracked; keep untracked junk out of the snap.
+    source-type: git
     build-packages:
       # The poetry plugin runs `python3 -m venv`, which needs ensurepip
       # from python3-venv. On core24 (Python 3.12) this coexists with
