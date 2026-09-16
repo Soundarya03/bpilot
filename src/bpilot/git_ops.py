@@ -112,6 +112,16 @@ def current_branch(cwd: Path) -> str:
     return name or "HEAD"
 
 
+def branch_exists(branch: str, *, cwd: Path) -> bool:
+    """True when a local branch named `branch` exists."""
+    proc = _run(
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=cwd,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
 def fetch_target_branch(branch: str, *, cwd: Path, remote: str = "origin") -> bool:
     """Fetch `branch` from `remote` and create/update a local tracking ref.
 
@@ -145,10 +155,20 @@ def create_backport_branch(target_branch: str, commits_id: str, *, cwd: Path) ->
     `commits_id` should be a short, filesystem-safe identifier for the
     backported commits (e.g. the short SHA of a single commit, or the
     range with `/` replaced).
+
+    Fails fast with a clear message when the branch already exists locally
+    (e.g. a previous `port` run for the same commits + target) instead of
+    surfacing git's raw "already exists" error.
     """
     safe_target = target_branch.replace("/", "-")
     safe_commits = commits_id.replace("/", "-")[:12]
     branch = f"backport/{safe_commits}-to-{safe_target}"
+    if branch_exists(branch, cwd=cwd):
+        raise GitError(
+            f"backport branch {branch!r} already exists. Run `bpilot reset` "
+            f"to discard the previous session, or delete the branch manually "
+            f"(git branch -D {branch}) and re-run."
+        )
     _run(["checkout", "-b", branch, target_branch], cwd=cwd)
     return branch
 
