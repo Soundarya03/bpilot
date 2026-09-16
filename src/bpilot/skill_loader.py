@@ -29,6 +29,7 @@ SECTION_LIFECYCLE_HOOKS = "Lifecycle Hooks"
 SECTION_UPGRADE_PATH = "Upgrade Path"
 SECTION_THINGS_TO_CHECK = "Things to Check When Backporting"
 SECTION_VERIFICATION_CHECKS = "Verification Checks"
+SECTION_FORMAT_COMMANDS = "Format Commands"
 SECTION_TEST_COMMANDS = "Test Commands"  # legacy alias for Verification Checks
 SECTION_KNOWN_DIVERGENCES = "Known Divergences Between Branches"
 SECTION_FILES_OF_INTEREST = "Files of Interest"
@@ -130,10 +131,10 @@ class SkillFile:
     def verification_checks(self) -> list[str]:
         """Extract shell commands from the 'Verification Checks' section.
 
-        Holds the format, lint, and unit-test commands the tool runs after
-        a backport (with an LLM-assisted repair loop on failure). Falls back
-        to the legacy 'Test Commands' section when 'Verification Checks'
-        is absent, so existing skill files keep working.
+        Holds the read-only validation commands (lint, unit tests) the tool
+        runs after a backport (with an LLM-assisted repair loop on failure).
+        Falls back to the legacy 'Test Commands' section when 'Verification
+        Checks' is absent, so existing skill files keep working.
 
         Each non-empty line is parsed for a backtick-wrapped command or, if
         no backticks are present, the whole line (after stripping list
@@ -148,6 +149,26 @@ class SkillFile:
         if commands:
             return commands
         return _extract_commands(self.get_section(SECTION_TEST_COMMANDS))
+
+    @property
+    def format_commands(self) -> list[str]:
+        """Extract shell commands from the 'Format Commands' section.
+
+        Holds the mutating format commands (e.g. `tox -e format`, `cargo fmt`,
+        `gofmt -w`, `black`, `prettier --write`) that bpilot runs before
+        verification checks. These are deterministic auto-fixers — no LLM
+        involved — and any changes they make are committed separately.
+
+        Each non-empty line is parsed for a backtick-wrapped command or, if
+        no backticks are present, the whole line (after stripping list
+        markers) is taken as a command. Lines that are plain prose with no
+        recognisable tool name are skipped.
+
+        HTML comments are stripped before parsing, so the starter
+        template's placeholders contribute no commands on a
+        freshly-scaffolded skill.
+        """
+        return _extract_commands(self.get_section(SECTION_FORMAT_COMMANDS))
 
     @property
     def test_commands(self) -> list[str]:
@@ -469,9 +490,13 @@ _STARTER_TEMPLATES: dict[str, str] = {
         "Used by bpilot to verify a ported change and to drive the LLM repair loop "
         "on failure.\n"
         "---\n"
+        "## Format Commands\n"
+        "<!-- One command per line, backtick-wrapped. Mutating auto-fixers run before verification. -->\n"
+        "<!-- e.g. `(cd kubernetes && tox run -e format)` -->\n"
+        "<!-- e.g. `cargo fmt` / `black src/` / `prettier --write .` -->\n"
+        "\n"
         "## Verification Checks\n"
-        "<!-- One command per line, backtick-wrapped. -->\n"
-        "<!-- e.g. Format: `ruff format src/ tests/` -->\n"
+        "<!-- One command per line, backtick-wrapped. Read-only validators. -->\n"
         "<!-- e.g. Lint:   `ruff check src/ tests/` -->\n"
         "<!-- e.g. Tests:  `PYTHONPATH=src poetry run pytest tests/unit/ -q` -->\n"
         "\n"

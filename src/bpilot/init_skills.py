@@ -228,17 +228,24 @@ def _build_verification_prompt(files: dict[str, str], probe_files: list[str]) ->
             "(3) unit tests. Use the project's own invocation style (e.g. "
             "`poetry run ...`, `npm run ...`, `make ...`).",
             "",
-            "Output the markdown body for the skill file, containing TWO sections in this order:",
+            "Output the markdown body for the skill file, containing THREE sections in this order:",
+            "  ## Format Commands",
+            "    One command per line, backtick-wrapped, with a leading "
+            "'- ' list marker. These are mutating auto-fixers (e.g. "
+            "`tox -e format`, `cargo fmt`, `black`, `prettier --write`). "
+            "bpilot runs these first and commits any changes separately.",
             "  ## Verification Checks",
             "    One command per line, backtick-wrapped, with a leading "
-            "'- ' list marker and a label prefix (Format:, Lint:, Tests:).",
+            "'- ' list marker and a label prefix (Lint:, Tests:). These "
+            "are read-only validators (e.g. `tox -e lint`, `pytest`, "
+            "`cargo clippy`). The LLM fix loop only engages on failures here.",
             "  ## Test Commands",
             "    A legacy alias for Verification Checks; populate it with the "
             "unit-test command only, or leave a placeholder HTML comment if "
             "Verification Checks already covers it.",
             "",
-            "Output ONLY the markdown body starting with '## Verification "
-            "Checks'. No frontmatter, no code fences, no explanations. If you "
+            "Output ONLY the markdown body starting with '## Format "
+            "Commands'. No frontmatter, no code fences, no explanations. If you "
             "cannot infer a command, omit that line rather than guessing.",
         ]
     )

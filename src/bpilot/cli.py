@@ -79,7 +79,13 @@ from bpilot.skill_loader import (
     init_skills_dir,
     load_skill_set,
 )
-from bpilot.validator import VerificationResult, run_verification_checks, validate_changes
+from bpilot.validator import (
+    FormatResult,
+    VerificationResult,
+    run_format_commands,
+    run_verification_checks,
+    validate_changes,
+)
 from bpilot.verification_fixer import FixResult, run_verification_checks_with_fixes
 
 
@@ -775,8 +781,28 @@ def _run_post_pipeline(
             _stage_all_and_amend(cwd=repo_root)
             head_sha = current_head(cwd=repo_root)
 
-        # Verification checks (format, lint, unit tests) + LLM fix loop.
-        print("running verification checks (format / lint / unit tests) ...")
+        # Format commands (mutating auto-fixers) — run before verification.
+        format_result: FormatResult | None = None
+        if setup.skill_set is not None:
+            print("running format commands (auto-fixers) ...")
+            format_result = run_format_commands(
+                cwd=repo_root,
+                skill_set=setup.skill_set,
+            )
+            if format_result.files_changed:
+                print("  committing auto-format changes ...")
+                _stage_all_and_commit(
+                    "style: auto-format baseline before verification",
+                    cwd=repo_root,
+                )
+                head_sha = current_head(cwd=repo_root)
+            if not format_result.ok:
+                verification_notes.append(
+                    "format commands failed; verification may be unreliable"
+                )
+
+        # Verification checks (lint, unit tests) + LLM fix loop.
+        print("running verification checks (lint / unit tests) ...")
         fix_result = run_verification_checks_with_fixes(
             cwd=repo_root,
             skill_set=setup.skill_set,
@@ -946,6 +972,18 @@ def _stage_all_and_amend(*, cwd: Path) -> None:
     env = dict(os.environ)
     env["GIT_EDITOR"] = "true"
     _run(["commit", "--amend", "--no-edit"], cwd=cwd, env=env)
+
+
+def _stage_all_and_commit(message: str, *, cwd: Path) -> None:
+    """Stage all changes and create a new commit.
+
+    Used after format commands run to capture auto-fixes as a separate,
+    clearly-labelled commit rather than amending the backport.
+    """
+    from bpilot.git_ops import _run
+
+    _run(["add", "-u"], cwd=cwd)
+    _run(["commit", "-m", message], cwd=cwd)
 
 
 # Truncate each failing command's combined output to this many lines in the

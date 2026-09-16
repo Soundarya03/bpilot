@@ -154,6 +154,20 @@ class VerificationResult:
         return "\n".join(lines).strip()
 
 
+@dataclass
+class FormatResult:
+    """Outcome of running format (auto-fix) commands once."""
+
+    ok: bool = True
+    skipped: bool = False  # True when no format commands configured
+    commands: list[CommandResult] = field(default_factory=list)
+    files_changed: list[str] = field(default_factory=list)
+
+    @property
+    def failures(self) -> list[CommandResult]:
+        return [c for c in self.commands if not c.ok]
+
+
 def validate_file(path: str, *, cwd: Path) -> ValidationResult:
     """Run per-file static checks on a single file in the working tree.
 
@@ -237,6 +251,84 @@ def validate_changes(
         _regen_locks(cwd, result, changed_files)
 
     return result
+
+
+def run_format_commands(
+    *,
+    cwd: Path,
+    skill_set: SkillSet | None = None,
+) -> FormatResult:
+    """Run the project's format (auto-fix) commands once.
+
+    Commands are sourced from the `verification-checks` skill's
+    "Format Commands" section. These are mutating auto-fixers (e.g.
+    `tox -e format`, `cargo fmt`, `black`, `prettier --write`) that
+    bpilot runs before verification checks. Any changes they make are
+    committed separately by the caller.
+
+    Returns a FormatResult with per-command outcomes and a list of files
+    that were modified (detected via git diff before/after).
+    """
+    commands: list[str] = []
+    if skill_set is not None:
+        verification_skill = skill_set.get("verification-checks")
+        if verification_skill is not None:
+            commands.extend(verification_skill.format_commands)
+
+    if not commands:
+        return FormatResult(ok=True, skipped=True)
+
+    # Snapshot which files are dirty before running formatters.
+    pre_dirty = set(_git_dirty_files(cwd))
+
+    result = FormatResult(ok=True)
+    for cmd_str in commands:
+        print(f"  running format: {cmd_str} ...")
+        proc = subprocess.run(
+            cmd_str,
+            cwd=cwd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_tool_env(),
+        )
+        cr = CommandResult(
+            command=cmd_str,
+            ok=proc.returncode == 0,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            returncode=proc.returncode,
+        )
+        result.commands.append(cr)
+        if not cr.ok:
+            result.ok = False
+
+    # Any newly-modified files are the format results.
+    post_dirty = set(_git_dirty_files(cwd))
+    result.files_changed = sorted(post_dirty - pre_dirty)
+    return result
+
+
+def _git_dirty_files(cwd: Path) -> list[str]:
+    """Return files with uncommitted changes (tracked + untracked)."""
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    files = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        # porcelain format: XY <path> or XY <orig> -> <path>
+        path = line[3:].split(" -> ")[-1]
+        files.append(path)
+    return files
 
 
 def run_verification_checks(
