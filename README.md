@@ -1,6 +1,7 @@
 # bpilot
 
-Intelligent backport helper for git repositories. bpilot automates the
+Intelligent backport helper for git repositories; helps backport/forwardport 
+changes from one branch to another. bpilot automates the
 mechanical parts of backporting (fetch, branch, cherry-pick) and adds
 an LLM-assisted layer for conflict resolution and semantic gap analysis.
 
