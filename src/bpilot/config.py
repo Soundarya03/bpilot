@@ -61,7 +61,10 @@ def _read_snap_config() -> dict[str, Any]:
     running outside the snap). Snap config keys use dashes (snap
     convention); we normalise to underscores for attribute access.
     """
-    if not SNAP_CONFIG_PATH.is_file():
+    # Only honor snap config when actually running under snapd. Without this
+    # guard, a pip/pipx install (SNAP_DATA unset) would resolve the path
+    # relative to the user's cwd and pick up a stray ./bpilot.conf.
+    if not os.environ.get("SNAP_DATA") or not SNAP_CONFIG_PATH.is_file():
         return {}
     try:
         raw = json.loads(SNAP_CONFIG_PATH.read_text())

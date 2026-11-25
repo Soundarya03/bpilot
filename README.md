@@ -9,6 +9,19 @@ The LLM is a pure text-in/text-out function. It never sees git
 credentials and never executes anything, all repo mutation goes
 through the deterministic git-ops layer. Also, bpilot never merges.
 
+## Install
+
+Requires Python >= 3.10 and `git` on PATH.
+
+```bash
+pipx install bpilot      # recommended: isolated env for the CLI
+# or
+pip install bpilot
+```
+
+Both work the same on developer machines and in CI (e.g. a
+`pip install bpilot` step in GitHub Actions).
+
 ## Usage
 
 bpilot offers 4 commands. All to be run from the root of your project.
