@@ -83,8 +83,7 @@ class LLMClient:
         if not config.has_llm:
             raise LLMError(
                 "no OpenRouter API key configured — "
-                "set OPENROUTER_API_KEY, `snap set bpilot openrouter-api-key=...`, "
-                "or pass --no-llm"
+                "set OPENROUTER_API_KEY or pass --no-llm"
             )
         self._config = config
         self._usage = usage or UsageStats(model=config.model)
