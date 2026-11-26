@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bpilot",
-        description="Intelligent backport helper (snap-packaged).",
+        description="Intelligent backport helper for git repositories.",
     )
     parser.add_argument("--version", action="store_true", help="Print version and exit.")
     sub = parser.add_subparsers(dest="command")
@@ -302,8 +302,7 @@ def _cmd_init(args: argparse.Namespace, repo_root: Path) -> int:
         if not config.has_llm:
             print(
                 "note: no OpenRouter API key configured; scaffolding "
-                "placeholders only. Set OPENROUTER_API_KEY or "
-                "`snap set bpilot openrouter-api-key=...` to enable LLM "
+                "placeholders only. Set OPENROUTER_API_KEY to enable LLM "
                 "inference of starter skills.",
                 file=sys.stderr,
             )
@@ -358,8 +357,7 @@ def _setup_port_run(args: argparse.Namespace, repo_root: Path) -> _PortSetup:
     if use_llm and not config.has_llm:
         print(
             "note: no OpenRouter API key configured; running in --no-llm mode. "
-            "Set OPENROUTER_API_KEY or `snap set bpilot openrouter-api-key=...` "
-            "to enable LLM features.",
+            "Set OPENROUTER_API_KEY to enable LLM features.",
             file=sys.stderr,
         )
         use_llm = False
